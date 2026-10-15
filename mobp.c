@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <string.h>
+#define ID_TRAY_ABOUT 1003
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_TOGGLE 1001
@@ -150,6 +151,8 @@ static void ShowTrayMenu(void)
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE,
                 g_mobpRunning ? L"关闭 mobp" : L"启动 mobp");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"关于");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
     SetForegroundWindow(g_hwndMain);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwndMain, NULL);
@@ -174,9 +177,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             else
                 StartMobp();
             return 0;
-        case ID_TRAY_EXIT:
-            DestroyWindow(hwnd);
+        case ID_TRAY_ABOUT:
+        {
+            int ret = MessageBoxW(hwnd,
+                                  L"mobp - Office 后台快速启动\n\n"
+                                  L"项目地址:\n"
+                                  L"https://github.com/TanJikun/mobp\n\n"
+                                  L"如果这个工具帮到了你，\n"
+                                  L"记得去 GitHub 点个 Star 支持一下！\n\n"
+                                  L"是否现在打开项目页面？",
+                                  L"关于 mobp",
+                                  MB_YESNO | MB_ICONINFORMATION);
+            if (ret == IDYES)
+            {
+                ShellExecuteW(NULL, L"open",
+                              L"https://github.com/TanJikun/mobp",
+                              NULL, NULL, SW_SHOWNORMAL);
+            }
             return 0;
+        }
         }
         return 0;
 
