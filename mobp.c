@@ -1,0 +1,248 @@
+#include <windows.h>
+#include <shellapi.h>
+#include <string.h>
+
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_TOGGLE 1001
+#define ID_TRAY_EXIT 1002
+
+static const char *TITLE_KEYWORD = "_mobp";
+static const char *WORD_CLASS = "OpusApp";
+static const char *EXCEL_CLASS = "XLMAIN";
+static const char *PPT_CLASS = "PPTFrameClass";
+static const wchar_t *WND_CLASSNAME = L"MobpTrayWindow";
+
+static HWND g_hwndMain = NULL;
+static NOTIFYICONDATAW g_nid = {0};
+static HWINEVENTHOOK g_hook = NULL;
+static BOOL g_mobpRunning = FALSE;
+
+static BOOL IsOfficeClass(const char *cls)
+{
+    return strcmp(cls, WORD_CLASS) == 0 ||
+           strcmp(cls, EXCEL_CLASS) == 0 ||
+           strcmp(cls, PPT_CLASS) == 0;
+}
+
+static HWND QueryWindow(const char *cls, const char *keyword)
+{
+    char title[256];
+    HWND hwnd = NULL, after = NULL;
+    while ((hwnd = FindWindowExA(NULL, after, cls, NULL)))
+    {
+        GetWindowTextA(hwnd, title, sizeof(title));
+        if (strstr(title, keyword))
+            break;
+        after = hwnd;
+    }
+    return hwnd;
+}
+
+static BOOL CloseWindowByQuery(const char *cls, const char *keyword)
+{
+    HWND hwnd = QueryWindow(cls, keyword);
+    if (hwnd)
+    {
+        PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void HideMobpWindow(HWND hwnd)
+{
+    SetWindowLong(hwnd, GWL_EXSTYLE, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+    SetWindowPos(hwnd, HWND_BOTTOM, -10000, -10000, 0, 0,
+                 SWP_NOSENDCHANGING | SWP_NOACTIVATE);
+}
+
+static void ScanExistingWindows(void)
+{
+    const char *classes[] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
+    for (int i = 0; i < 3; i++)
+    {
+        HWND hwnd = NULL, after = NULL;
+        while ((hwnd = FindWindowExA(NULL, after, classes[i], NULL)))
+        {
+            after = hwnd;
+            char title[256];
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (strstr(title, TITLE_KEYWORD))
+                HideMobpWindow(hwnd);
+        }
+    }
+}
+
+static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
+                                  LONG idObject, LONG idChild,
+                                  DWORD dwThread, DWORD dwTime)
+{
+    if (event != EVENT_OBJECT_SHOW)
+        return;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
+        return;
+    if (GetParent(hwnd) != NULL)
+        return;
+
+    char cls[256];
+    if (!GetClassNameA(hwnd, cls, sizeof(cls)))
+        return;
+    if (!IsOfficeClass(cls))
+        return;
+
+    char title[256];
+    GetWindowTextA(hwnd, title, sizeof(title));
+
+    if (strstr(title, TITLE_KEYWORD))
+        HideMobpWindow(hwnd);
+    else
+        ShowWindow(hwnd, SW_MAXIMIZE);
+}
+
+static void StartMobp(void)
+{
+    ShellExecuteA(
+        NULL, NULL, "cmd",
+        "/c "
+        "cd /d %temp%"
+        "&"
+        "cd.>_mobp.docx"
+        "&"
+        "cd.>_mobp.xlk"
+        "&"
+        "cd.>_mobp.pptx"
+        "&"
+        "start \"\" _mobp.docx"
+        "&"
+        "start \"\" _mobp.xlk"
+        "&"
+        "start \"\" _mobp.pptx",
+        NULL, SW_HIDE);
+    g_mobpRunning = TRUE;
+}
+
+static void StopMobp(void)
+{
+    CloseWindowByQuery(WORD_CLASS, TITLE_KEYWORD);
+    CloseWindowByQuery(EXCEL_CLASS, TITLE_KEYWORD);
+    CloseWindowByQuery(PPT_CLASS, TITLE_KEYWORD);
+    g_mobpRunning = FALSE;
+}
+
+static void AddTrayIcon(void)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+    g_nid.hWnd = g_hwndMain;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    lstrcpyW(g_nid.szTip, L"mobp - Office 后台快速启动");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+static void ShowTrayMenu(void)
+{
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE,
+                g_mobpRunning ? L"关闭 mobp" : L"启动 mobp");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
+    SetForegroundWindow(g_hwndMain);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwndMain, NULL);
+    DestroyMenu(hMenu);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP)
+            ShowTrayMenu();
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+        case ID_TRAY_TOGGLE:
+            if (g_mobpRunning)
+                StopMobp();
+            else
+                StartMobp();
+            return 0;
+        case ID_TRAY_EXIT:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow)
+{
+    // 单实例
+    HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;
+
+    // 注册窗口类 + 创建隐藏主窗口
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = WND_CLASSNAME;
+    RegisterClassW(&wc);
+
+    g_hwndMain = CreateWindowW(WND_CLASSNAME, L"mobp", 0,
+                               0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+
+    AddTrayIcon();
+
+    // 先挂钩子，再启动 mobp
+    g_hook = SetWinEventHook(
+        EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+        NULL, WinEventProc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    if (QueryWindow(WORD_CLASS, TITLE_KEYWORD))
+    {
+        g_mobpRunning = TRUE;
+    }
+    else
+    {
+        ULONGLONG uptime = GetTickCount64();
+        DWORD wait_ms = 1000;
+        if (uptime < 120000)
+            wait_ms = 30000;
+        else if (uptime < 300000)
+            wait_ms = 5000;
+        Sleep(wait_ms);
+
+        StartMobp();
+
+        Sleep(3000);
+        ScanExistingWindows();
+    }
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    if (g_hook)
+        UnhookWinEvent(g_hook);
+    if (hMutex)
+        CloseHandle(hMutex);
+    return 0;
+}
