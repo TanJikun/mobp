@@ -1,11 +1,13 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <string.h>
-#define ID_TRAY_ABOUT 1003
 
 #define WM_TRAYICON (WM_USER + 1)
-#define ID_TRAY_TOGGLE 1001
 #define ID_TRAY_EXIT 1002
+#define ID_TRAY_ABOUT 1003
+
+#define TIMER_SCAN 1
+#define TIMER_START_MOBP 2
 
 static const char *TITLE_KEYWORD = "_mobp";
 static const char *WORD_CLASS = "OpusApp";
@@ -39,27 +41,20 @@ static HWND QueryWindow(const char *cls, const char *keyword)
     return hwnd;
 }
 
-static BOOL CloseWindowByQuery(const char *cls, const char *keyword)
-{
-    HWND hwnd = QueryWindow(cls, keyword);
-    if (hwnd)
-    {
-        PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
-        return TRUE;
-    }
-    return FALSE;
-}
-
 static void HideMobpWindow(HWND hwnd)
 {
-    SetWindowLong(hwnd, GWL_EXSTYLE, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
-    SetWindowPos(hwnd, HWND_BOTTOM, -10000, -10000, 0, 0,
-                 SWP_NOSENDCHANGING | SWP_NOACTIVATE);
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+
+    SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
+                 SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_HIDEWINDOW);
 }
 
 static void ScanExistingWindows(void)
 {
     const char *classes[] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
+    BOOL found_any = FALSE;
+
     for (int i = 0; i < 3; i++)
     {
         HWND hwnd = NULL, after = NULL;
@@ -69,8 +64,16 @@ static void ScanExistingWindows(void)
             char title[256];
             GetWindowTextA(hwnd, title, sizeof(title));
             if (strstr(title, TITLE_KEYWORD))
+            {
                 HideMobpWindow(hwnd);
+                found_any = TRUE;
+            }
         }
+    }
+
+    if (found_any)
+    {
+        g_mobpRunning = TRUE;
     }
 }
 
@@ -95,9 +98,18 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     GetWindowTextA(hwnd, title, sizeof(title));
 
     if (strstr(title, TITLE_KEYWORD))
+    {
         HideMobpWindow(hwnd);
+        g_mobpRunning = TRUE;
+    }
     else
-        ShowWindow(hwnd, SW_MAXIMIZE);
+    {
+        // 【修复】只有当前不是最大化状态时，才执行最大化，防止打断用户的手动还原
+        if (!IsZoomed(hwnd))
+        {
+            ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+    }
 }
 
 static void StartMobp(void)
@@ -122,14 +134,6 @@ static void StartMobp(void)
     g_mobpRunning = TRUE;
 }
 
-static void StopMobp(void)
-{
-    CloseWindowByQuery(WORD_CLASS, TITLE_KEYWORD);
-    CloseWindowByQuery(EXCEL_CLASS, TITLE_KEYWORD);
-    CloseWindowByQuery(PPT_CLASS, TITLE_KEYWORD);
-    g_mobpRunning = FALSE;
-}
-
 static void AddTrayIcon(void)
 {
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -148,12 +152,11 @@ static void ShowTrayMenu(void)
     POINT pt;
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_TOGGLE,
-                g_mobpRunning ? L"关闭 mobp" : L"启动 mobp");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"关于");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
+
     SetForegroundWindow(g_hwndMain);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwndMain, NULL);
     DestroyMenu(hMenu);
@@ -171,12 +174,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
-        case ID_TRAY_TOGGLE:
-            if (g_mobpRunning)
-                StopMobp();
-            else
-                StartMobp();
-            return 0;
         case ID_TRAY_ABOUT:
         {
             int ret = MessageBoxW(hwnd,
@@ -190,16 +187,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                                   MB_YESNO | MB_ICONINFORMATION);
             if (ret == IDYES)
             {
-                ShellExecuteW(NULL, L"open",
-                              L"https://github.com/TanJikun/mobp",
+                ShellExecuteW(NULL, L"open", L"https://github.com/TanJikun/mobp",
                               NULL, NULL, SW_SHOWNORMAL);
             }
             return 0;
         }
+
+        case ID_TRAY_EXIT:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == TIMER_SCAN)
+        {
+            ScanExistingWindows();
+        }
+        else if (wParam == TIMER_START_MOBP)
+        {
+            KillTimer(hwnd, TIMER_START_MOBP);
+            StartMobp();
         }
         return 0;
 
     case WM_DESTROY:
+        // 【修复】退出时清理定时器，养成好习惯
+        KillTimer(hwnd, TIMER_SCAN);
+        KillTimer(hwnd, TIMER_START_MOBP);
+
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -209,12 +225,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow)
 {
-    // 单实例
     HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        // 【修复】如果已有实例，释放新创建的句柄后退出，避免句柄泄漏
+        if (hMutex)
+            CloseHandle(hMutex);
         return 0;
+    }
 
-    // 注册窗口类 + 创建隐藏主窗口
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
@@ -226,11 +245,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 
     AddTrayIcon();
 
-    // 先挂钩子，再启动 mobp
     g_hook = SetWinEventHook(
         EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
         NULL, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    SetTimer(g_hwndMain, TIMER_SCAN, 1000, NULL);
 
     if (QueryWindow(WORD_CLASS, TITLE_KEYWORD))
     {
@@ -239,17 +259,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     else
     {
         ULONGLONG uptime = GetTickCount64();
-        DWORD wait_ms = 1000;
+        UINT wait_ms = 1000;
         if (uptime < 120000)
             wait_ms = 30000;
         else if (uptime < 300000)
             wait_ms = 5000;
-        Sleep(wait_ms);
 
-        StartMobp();
-
-        Sleep(3000);
-        ScanExistingWindows();
+        SetTimer(g_hwndMain, TIMER_START_MOBP, wait_ms, NULL);
     }
 
     MSG msg;
@@ -262,6 +278,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     if (g_hook)
         UnhookWinEvent(g_hook);
     if (hMutex)
-        CloseHandle(hMutex);
+        CloseHandle(hMutex); // 正常退出时释放互斥体
     return 0;
 }
