@@ -9,6 +9,8 @@
 #define TIMER_SCAN 1
 #define TIMER_START_MOBP 2
 
+#define IDI_ICON1 101 // 图标资源 ID
+
 static const char *TITLE_KEYWORD = "_mobp";
 static const char *WORD_CLASS = "OpusApp";
 static const char *EXCEL_CLASS = "XLMAIN";
@@ -19,6 +21,8 @@ static HWND g_hwndMain = NULL;
 static NOTIFYICONDATAW g_nid = {0};
 static HWINEVENTHOOK g_hook = NULL;
 static BOOL g_mobpRunning = FALSE;
+static HINSTANCE g_hInstance = NULL;
+static HICON g_hIcon = NULL;
 
 static BOOL IsOfficeClass(const char *cls)
 {
@@ -104,7 +108,6 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     }
     else
     {
-        // 【修复】只有当前不是最大化状态时，才执行最大化，防止打断用户的手动还原
         if (!IsZoomed(hwnd))
         {
             ShowWindow(hwnd, SW_MAXIMIZE);
@@ -136,17 +139,35 @@ static void StartMobp(void)
 
 static void AddTrayIcon(void)
 {
+    // 1. 初始化托盘结构体（这部分不能删）
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(NOTIFYICONDATAW);
     g_nid.hWnd = g_hwndMain;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+
+    // 2. 动态加载系统托盘标准尺寸（这里换成带兜底的代码）
+    int cx = GetSystemMetrics(SM_CXSMICON);
+    int cy = GetSystemMetrics(SM_CYSMICON);
+
+    // 尝试加载我们自己的图标
+    g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1),
+                                IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+
+    // 如果加载失败，退回到系统默认图标
+    if (g_hIcon == NULL)
+    {
+        g_hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    }
+    g_nid.hIcon = g_hIcon;
+
+    // 3. 设置鼠标悬停时的提示文字（这部分不能删）
     lstrcpyW(g_nid.szTip, L"mobp - Office 后台快速启动");
+
+    // 4. 真正把图标添加到右下角托盘（这部分不能删）
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
-
 static void ShowTrayMenu(void)
 {
     POINT pt;
@@ -212,7 +233,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_DESTROY:
-        // 【修复】退出时清理定时器，养成好习惯
         KillTimer(hwnd, TIMER_SCAN);
         KillTimer(hwnd, TIMER_START_MOBP);
 
@@ -225,10 +245,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow)
 {
+    g_hInstance = hInstance;
+
     HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        // 【修复】如果已有实例，释放新创建的句柄后退出，避免句柄泄漏
         if (hMutex)
             CloseHandle(hMutex);
         return 0;
@@ -238,6 +259,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = WND_CLASSNAME;
+    // 关联窗口类图标（影响任务栏和 Alt+Tab 显示）
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_ICON1));
     RegisterClassW(&wc);
 
     g_hwndMain = CreateWindowW(WND_CLASSNAME, L"mobp", 0,
@@ -277,7 +300,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 
     if (g_hook)
         UnhookWinEvent(g_hook);
+    if (g_hIcon)
+        DestroyIcon(g_hIcon);
     if (hMutex)
-        CloseHandle(hMutex); // 正常退出时释放互斥体
+        CloseHandle(hMutex);
     return 0;
 }
