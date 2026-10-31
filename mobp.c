@@ -9,7 +9,8 @@
 #define TIMER_SCAN 1
 #define TIMER_START_MOBP 2
 
-#define IDI_ICON1 101 // 图标资源 ID
+#define IDI_ICON1 101
+#define IDI_ICON2 1
 
 static const char *TITLE_KEYWORD = "_mobp";
 static const char *WORD_CLASS = "OpusApp";
@@ -45,6 +46,15 @@ static HWND QueryWindow(const char *cls, const char *keyword)
     return hwnd;
 }
 
+static void CloseWindowByQuery(const char *cls, const char *keyword)
+{
+    HWND hwnd = QueryWindow(cls, keyword);
+    if (hwnd)
+    {
+        PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+    }
+}
+
 static void HideMobpWindow(HWND hwnd)
 {
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -52,6 +62,8 @@ static void HideMobpWindow(HWND hwnd)
 
     SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
                  SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+
+    ShowWindow(hwnd, SW_HIDE);
 }
 
 static void ScanExistingWindows(void)
@@ -139,7 +151,6 @@ static void StartMobp(void)
 
 static void AddTrayIcon(void)
 {
-    // 1. 初始化托盘结构体（这部分不能删）
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(NOTIFYICONDATAW);
     g_nid.hWnd = g_hwndMain;
@@ -147,27 +158,47 @@ static void AddTrayIcon(void)
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
 
-    // 2. 动态加载系统托盘标准尺寸（这里换成带兜底的代码）
     int cx = GetSystemMetrics(SM_CXSMICON);
     int cy = GetSystemMetrics(SM_CYSMICON);
 
-    // 尝试加载我们自己的图标
-    g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1),
-                                IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+    // 1. 尝试提取指定尺寸
+    g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
 
-    // 如果加载失败，退回到系统默认图标
-    if (g_hIcon == NULL)
+    // 2. 尝试提取默认尺寸
+    if (!g_hIcon)
     {
-        g_hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
     }
-    g_nid.hIcon = g_hIcon;
 
-    // 3. 设置鼠标悬停时的提示文字（这部分不能删）
+    // 3. 尝试 LoadIconW
+    if (!g_hIcon)
+    {
+        g_hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
+    }
+    if (!g_hIcon)
+    {
+        g_hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON2));
+    }
+
+    // 4. 系统兜底
+    if (!g_hIcon)
+    {
+        g_hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    }
+
+    g_nid.hIcon = g_hIcon;
     lstrcpyW(g_nid.szTip, L"mobp - Office 后台快速启动");
 
-    // 4. 真正把图标添加到右下角托盘（这部分不能删）
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    // 强制清理可能残留的旧图标，然后再添加
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+    {
+        // 如果失败，稍等 100ms 再试一次
+        Sleep(100);
+        Shell_NotifyIconW(NIM_ADD, &g_nid);
+    }
 }
+
 static void ShowTrayMenu(void)
 {
     POINT pt;
@@ -176,11 +207,13 @@ static void ShowTrayMenu(void)
 
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"关于");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出（并关闭Office）");
 
     SetForegroundWindow(g_hwndMain);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwndMain, NULL);
     DestroyMenu(hMenu);
+
+    PostMessage(g_hwndMain, WM_NULL, 0, 0);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -188,8 +221,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg)
     {
     case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP)
+        if (lParam == WM_LBUTTONUP || lParam == WM_RBUTTONUP)
+        {
             ShowTrayMenu();
+        }
         return 0;
 
     case WM_COMMAND:
@@ -215,6 +250,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case ID_TRAY_EXIT:
+            // 1. 先发送优雅关闭
+            CloseWindowByQuery(WORD_CLASS, TITLE_KEYWORD);
+            CloseWindowByQuery(EXCEL_CLASS, TITLE_KEYWORD);
+            CloseWindowByQuery(PPT_CLASS, TITLE_KEYWORD);
+
+            // 2. 强制杀掉残留的 Office 后台进程（防止插件或 COM 服务让进程假死）
+            WinExec("taskkill /F /IM WINWORD.EXE /IM EXCEL.EXE /IM POWERPNT.EXE /T >nul 2>&1", SW_HIDE);
+
             DestroyWindow(hwnd);
             return 0;
         }
@@ -247,7 +290,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 {
     g_hInstance = hInstance;
 
-    HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex");
+    // 【重要】修改了 Mutex 名字，防止被旧版本的幽灵进程拦住无法启动
+    HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex_v4");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         if (hMutex)
@@ -259,8 +303,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = WND_CLASSNAME;
-    // 关联窗口类图标（影响任务栏和 Alt+Tab 显示）
-    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_ICON1));
     RegisterClassW(&wc);
 
     g_hwndMain = CreateWindowW(WND_CLASSNAME, L"mobp", 0,
@@ -273,7 +315,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
         NULL, WinEventProc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    SetTimer(g_hwndMain, TIMER_SCAN, 1000, NULL);
+    SetTimer(g_hwndMain, TIMER_SCAN, 200, NULL);
 
     if (QueryWindow(WORD_CLASS, TITLE_KEYWORD))
     {
