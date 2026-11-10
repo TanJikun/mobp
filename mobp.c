@@ -1,6 +1,6 @@
 #include <windows.h>
 #include <shellapi.h>
-#include <string.h>
+#include <wchar.h>
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1002
@@ -10,49 +10,41 @@
 #define TIMER_START_MOBP 2
 
 #define IDI_ICON1 101
-#define IDI_ICON2 1
 
-static const char *TITLE_KEYWORD = "_mobp";
-static const char *WORD_CLASS = "OpusApp";
-static const char *EXCEL_CLASS = "XLMAIN";
-static const char *PPT_CLASS = "PPTFrameClass";
+#define MAX_PIDS 64
+
+static const wchar_t *TITLE_KEYWORD = L"_mobp";
+static const wchar_t *WORD_CLASS = L"OpusApp";
+static const wchar_t *EXCEL_CLASS = L"XLMAIN";
+static const wchar_t *PPT_CLASS = L"PPTFrameClass";
 static const wchar_t *WND_CLASSNAME = L"MobpTrayWindow";
 
 static HWND g_hwndMain = NULL;
 static NOTIFYICONDATAW g_nid = {0};
 static HWINEVENTHOOK g_hook = NULL;
-static BOOL g_mobpRunning = FALSE;
 static HINSTANCE g_hInstance = NULL;
 static HICON g_hIcon = NULL;
+static BOOL g_OwnsIcon = FALSE;
 
-static BOOL IsOfficeClass(const char *cls)
+static BOOL IsOfficeClass(const wchar_t *cls)
 {
-    return strcmp(cls, WORD_CLASS) == 0 ||
-           strcmp(cls, EXCEL_CLASS) == 0 ||
-           strcmp(cls, PPT_CLASS) == 0;
+    return wcscmp(cls, WORD_CLASS) == 0 ||
+           wcscmp(cls, EXCEL_CLASS) == 0 ||
+           wcscmp(cls, PPT_CLASS) == 0;
 }
 
-static HWND QueryWindow(const char *cls, const char *keyword)
+static HWND QueryWindow(const wchar_t *cls, const wchar_t *keyword)
 {
-    char title[256];
+    wchar_t title[256];
     HWND hwnd = NULL, after = NULL;
-    while ((hwnd = FindWindowExA(NULL, after, cls, NULL)))
+    while ((hwnd = FindWindowExW(NULL, after, cls, NULL)))
     {
-        GetWindowTextA(hwnd, title, sizeof(title));
-        if (strstr(title, keyword))
+        GetWindowTextW(hwnd, title, 256);
+        if (wcsstr(title, keyword))
             break;
         after = hwnd;
     }
     return hwnd;
-}
-
-static void CloseWindowByQuery(const char *cls, const char *keyword)
-{
-    HWND hwnd = QueryWindow(cls, keyword);
-    if (hwnd)
-    {
-        PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
-    }
 }
 
 static void HideMobpWindow(HWND hwnd)
@@ -61,35 +53,28 @@ static void HideMobpWindow(HWND hwnd)
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
 
     SetWindowPos(hwnd, HWND_BOTTOM, -32000, -32000, 0, 0,
-                 SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+                 SWP_NOSENDCHANGING | SWP_NOACTIVATE | SWP_HIDEWINDOW | SWP_NOSIZE);
 
     ShowWindow(hwnd, SW_HIDE);
 }
 
 static void ScanExistingWindows(void)
 {
-    const char *classes[] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
-    BOOL found_any = FALSE;
+    const wchar_t *classes[] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
 
     for (int i = 0; i < 3; i++)
     {
         HWND hwnd = NULL, after = NULL;
-        while ((hwnd = FindWindowExA(NULL, after, classes[i], NULL)))
+        while ((hwnd = FindWindowExW(NULL, after, classes[i], NULL)))
         {
             after = hwnd;
-            char title[256];
-            GetWindowTextA(hwnd, title, sizeof(title));
-            if (strstr(title, TITLE_KEYWORD))
+            wchar_t title[256];
+            GetWindowTextW(hwnd, title, 256);
+            if (wcsstr(title, TITLE_KEYWORD))
             {
                 HideMobpWindow(hwnd);
-                found_any = TRUE;
             }
         }
-    }
-
-    if (found_any)
-    {
-        g_mobpRunning = TRUE;
     }
 }
 
@@ -104,19 +89,18 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     if (GetParent(hwnd) != NULL)
         return;
 
-    char cls[256];
-    if (!GetClassNameA(hwnd, cls, sizeof(cls)))
+    wchar_t cls[256];
+    if (!GetClassNameW(hwnd, cls, 256))
         return;
     if (!IsOfficeClass(cls))
         return;
 
-    char title[256];
-    GetWindowTextA(hwnd, title, sizeof(title));
+    wchar_t title[256];
+    GetWindowTextW(hwnd, title, 256);
 
-    if (strstr(title, TITLE_KEYWORD))
+    if (wcsstr(title, TITLE_KEYWORD))
     {
         HideMobpWindow(hwnd);
-        g_mobpRunning = TRUE;
     }
     else
     {
@@ -129,24 +113,27 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
 
 static void StartMobp(void)
 {
-    ShellExecuteA(
-        NULL, NULL, "cmd",
-        "/c "
-        "cd /d %temp%"
-        "&"
-        "cd.>_mobp.docx"
-        "&"
-        "cd.>_mobp.xlk"
-        "&"
-        "cd.>_mobp.pptx"
-        "&"
-        "start \"\" _mobp.docx"
-        "&"
-        "start \"\" _mobp.xlk"
-        "&"
-        "start \"\" _mobp.pptx",
+    ShellExecuteW(
+        NULL, L"open", L"cmd",
+        L"/c "
+        L"md \"%LOCALAPPDATA%\\mobp\" 2>nul"
+        L"&"
+        L"cd /d \"%LOCALAPPDATA%\\mobp\" 2>nul || cd /d \"%temp%\""
+        L"&"
+        L"del /f /q _mobp.* ~$_mobp.* 2>nul"
+        L"&"
+        L"cd.>_mobp.docx"
+        L"&"
+        L"cd.>_mobp.xlk"
+        L"&"
+        L"cd.>_mobp.pptx"
+        L"&"
+        L"start \"\" _mobp.docx"
+        L"&"
+        L"start \"\" _mobp.xlk"
+        L"&"
+        L"start \"\" _mobp.pptx",
         NULL, SW_HIDE);
-    g_mobpRunning = TRUE;
 }
 
 static void AddTrayIcon(void)
@@ -161,26 +148,24 @@ static void AddTrayIcon(void)
     int cx = GetSystemMetrics(SM_CXSMICON);
     int cy = GetSystemMetrics(SM_CYSMICON);
 
-    // 1. 尝试提取指定尺寸
-    g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+    g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1),
+                                IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+    if (g_hIcon)
+        g_OwnsIcon = TRUE;
 
-    // 2. 尝试提取默认尺寸
     if (!g_hIcon)
     {
-        g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        g_hIcon = (HICON)LoadImageW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1),
+                                    IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        if (g_hIcon)
+            g_OwnsIcon = TRUE;
     }
 
-    // 3. 尝试 LoadIconW
     if (!g_hIcon)
     {
         g_hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON1));
     }
-    if (!g_hIcon)
-    {
-        g_hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_ICON2));
-    }
 
-    // 4. 系统兜底
     if (!g_hIcon)
     {
         g_hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
@@ -189,11 +174,9 @@ static void AddTrayIcon(void)
     g_nid.hIcon = g_hIcon;
     lstrcpyW(g_nid.szTip, L"mobp - Office 后台快速启动");
 
-    // 强制清理可能残留的旧图标，然后再添加
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
     {
-        // 如果失败，稍等 100ms 再试一次
         Sleep(100);
         Shell_NotifyIconW(NIM_ADD, &g_nid);
     }
@@ -207,13 +190,85 @@ static void ShowTrayMenu(void)
 
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_ABOUT, L"关于");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出（并关闭Office）");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出（关闭 mobp 后台）");
 
     SetForegroundWindow(g_hwndMain);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwndMain, NULL);
     DestroyMenu(hMenu);
 
     PostMessage(g_hwndMain, WM_NULL, 0, 0);
+}
+
+static void ShutdownMobp(void)
+{
+    const wchar_t *classes[] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
+    DWORD killPids[MAX_PIDS];
+    DWORD keepPids[MAX_PIDS];
+    int killCount = 0, keepCount = 0;
+
+    for (int i = 0; i < 3; i++)
+    {
+        HWND hwnd = NULL, after = NULL;
+        while ((hwnd = FindWindowExW(NULL, after, classes[i], NULL)))
+        {
+            after = hwnd;
+            wchar_t title[256];
+            GetWindowTextW(hwnd, title, 256);
+
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == 0)
+                continue;
+
+            if (wcsstr(title, TITLE_KEYWORD))
+            {
+                PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+
+                BOOL dup = FALSE;
+                for (int j = 0; j < killCount; j++)
+                    if (killPids[j] == pid)
+                    {
+                        dup = TRUE;
+                        break;
+                    }
+                if (!dup && killCount < MAX_PIDS)
+                    killPids[killCount++] = pid;
+            }
+            else
+            {
+                BOOL dup = FALSE;
+                for (int j = 0; j < keepCount; j++)
+                    if (keepPids[j] == pid)
+                    {
+                        dup = TRUE;
+                        break;
+                    }
+                if (!dup && keepCount < MAX_PIDS)
+                    keepPids[keepCount++] = pid;
+            }
+        }
+    }
+
+    for (int i = 0; i < killCount; i++)
+    {
+        BOOL shared = FALSE;
+        for (int j = 0; j < keepCount; j++)
+            if (killPids[i] == keepPids[j])
+            {
+                shared = TRUE;
+                break;
+            }
+        if (shared)
+            continue;
+
+        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, killPids[i]);
+        if (h)
+        {
+            if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT)
+                TerminateProcess(h, 1);
+            CloseHandle(h);
+        }
+    }
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -250,14 +305,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case ID_TRAY_EXIT:
-            // 1. 先发送优雅关闭
-            CloseWindowByQuery(WORD_CLASS, TITLE_KEYWORD);
-            CloseWindowByQuery(EXCEL_CLASS, TITLE_KEYWORD);
-            CloseWindowByQuery(PPT_CLASS, TITLE_KEYWORD);
-
-            // 2. 强制杀掉残留的 Office 后台进程（防止插件或 COM 服务让进程假死）
-            WinExec("taskkill /F /IM WINWORD.EXE /IM EXCEL.EXE /IM POWERPNT.EXE /T >nul 2>&1", SW_HIDE);
-
+            ShutdownMobp();
             DestroyWindow(hwnd);
             return 0;
         }
@@ -278,7 +326,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_SCAN);
         KillTimer(hwnd, TIMER_START_MOBP);
-
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -290,8 +337,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 {
     g_hInstance = hInstance;
 
-    // 【重要】修改了 Mutex 名字，防止被旧版本的幽灵进程拦住无法启动
-    HANDLE hMutex = CreateMutex(NULL, TRUE, "mobp_single_instance_mutex_v4");
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"mobp_single_instance_mutex_v5");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         if (hMutex)
@@ -319,7 +365,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 
     if (QueryWindow(WORD_CLASS, TITLE_KEYWORD))
     {
-        g_mobpRunning = TRUE;
     }
     else
     {
@@ -342,7 +387,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
 
     if (g_hook)
         UnhookWinEvent(g_hook);
-    if (g_hIcon)
+    if (g_hIcon && g_OwnsIcon)
         DestroyIcon(g_hIcon);
     if (hMutex)
         CloseHandle(hMutex);
