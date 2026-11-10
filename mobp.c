@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <wchar.h>
+#include <stdio.h>
 
 #define WM_TRAYICON (WM_USER + 1)
 #define ID_TRAY_EXIT 1002
@@ -8,10 +10,15 @@
 
 #define TIMER_SCAN 1
 #define TIMER_START_MOBP 2
+#define TIMER_WATCHDOG 3
 
 #define IDI_ICON1 101
 
 #define MAX_PIDS 64
+#define WATCHDOG_INTERVAL_MS 5000
+#define LAUNCH_GRACE_MS 30000
+#define MISSING_THRESHOLD 3
+#define MAX_RESTART_FAILS 3
 
 static const wchar_t *TITLE_KEYWORD = L"_mobp";
 static const wchar_t *WORD_CLASS = L"OpusApp";
@@ -25,6 +32,11 @@ static HWINEVENTHOOK g_hook = NULL;
 static HINSTANCE g_hInstance = NULL;
 static HICON g_hIcon = NULL;
 static BOOL g_OwnsIcon = FALSE;
+static BOOL g_mobpLaunched = FALSE;
+static BOOL g_shuttingDown = FALSE;
+static DWORD g_lastLaunchTick = 0;
+static int g_missingCount[3] = {0, 0, 0};
+static int g_restartFails[3] = {0, 0, 0};
 
 static BOOL IsOfficeClass(const wchar_t *cls)
 {
@@ -45,6 +57,33 @@ static HWND QueryWindow(const wchar_t *cls, const wchar_t *keyword)
         after = hwnd;
     }
     return hwnd;
+}
+
+static BOOL IsOfficeProcessRunning(const wchar_t *exeName)
+{
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+
+    BOOL found = FALSE;
+    if (Process32FirstW(hSnap, &pe))
+    {
+        do
+        {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0)
+            {
+                found = TRUE;
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+
+    CloseHandle(hSnap);
+    return found;
 }
 
 static void HideMobpWindow(HWND hwnd)
@@ -111,29 +150,74 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     }
 }
 
+static void StartOneOffice(const wchar_t *fileName)
+{
+    wchar_t cmd[1024];
+    swprintf(cmd, 1024,
+             L"/c md \"%%LOCALAPPDATA%%\\mobp\" 2>nul"
+             L"& cd /d \"%%LOCALAPPDATA%%\\mobp\" 2>nul || cd /d \"%%temp%%\""
+             L"& attrib -r -h -s %s 2>nul"
+             L"& del /f /q %s ~$%s 2>nul"
+             L"& cd.>%s"
+             L"& start \"\" %s",
+             fileName, fileName, fileName, fileName, fileName);
+    cmd[1023] = L'\0';
+    ShellExecuteW(NULL, L"open", L"cmd", cmd, NULL, SW_HIDE);
+}
+
 static void StartMobp(void)
 {
-    ShellExecuteW(
-        NULL, L"open", L"cmd",
-        L"/c "
-        L"md \"%LOCALAPPDATA%\\mobp\" 2>nul"
-        L"&"
-        L"cd /d \"%LOCALAPPDATA%\\mobp\" 2>nul || cd /d \"%temp%\""
-        L"&"
-        L"del /f /q _mobp.* ~$_mobp.* 2>nul"
-        L"&"
-        L"cd.>_mobp.docx"
-        L"&"
-        L"cd.>_mobp.xlk"
-        L"&"
-        L"cd.>_mobp.pptx"
-        L"&"
-        L"start \"\" _mobp.docx"
-        L"&"
-        L"start \"\" _mobp.xlk"
-        L"&"
-        L"start \"\" _mobp.pptx",
-        NULL, SW_HIDE);
+    StartOneOffice(L"_mobp.docx");
+    StartOneOffice(L"_mobp.xlk");
+    StartOneOffice(L"_mobp.pptx");
+    g_mobpLaunched = TRUE;
+    g_lastLaunchTick = GetTickCount();
+}
+
+static void CheckMobpHealth(void)
+{
+    if (!g_mobpLaunched || g_shuttingDown)
+        return;
+    if (GetTickCount() - g_lastLaunchTick < LAUNCH_GRACE_MS)
+        return;
+
+    const wchar_t *classes[3] = {WORD_CLASS, EXCEL_CLASS, PPT_CLASS};
+    const wchar_t *files[3] = {L"_mobp.docx", L"_mobp.xlk", L"_mobp.pptx"};
+    const wchar_t *exes[3] = {L"WINWORD.EXE", L"EXCEL.EXE", L"POWERPNT.EXE"};
+
+    BOOL restarted = FALSE;
+
+    for (int i = 0; i < 3; i++)
+    {
+        BOOL hasWindow = (QueryWindow(classes[i], TITLE_KEYWORD) != NULL);
+
+        if (hasWindow)
+        {
+            g_missingCount[i] = 0;
+            g_restartFails[i] = 0;
+            continue;
+        }
+
+        BOOL hasProcess = IsOfficeProcessRunning(exes[i]);
+
+        if (hasProcess)
+        {
+            g_missingCount[i]++;
+            if (g_missingCount[i] < MISSING_THRESHOLD)
+                continue;
+        }
+
+        if (g_restartFails[i] >= MAX_RESTART_FAILS)
+            continue;
+
+        StartOneOffice(files[i]);
+        g_restartFails[i]++;
+        g_missingCount[i] = 0;
+        restarted = TRUE;
+    }
+
+    if (restarted)
+        g_lastLaunchTick = GetTickCount();
 }
 
 static void AddTrayIcon(void)
@@ -305,6 +389,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case ID_TRAY_EXIT:
+            g_shuttingDown = TRUE;
             ShutdownMobp();
             DestroyWindow(hwnd);
             return 0;
@@ -321,11 +406,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             KillTimer(hwnd, TIMER_START_MOBP);
             StartMobp();
         }
+        else if (wParam == TIMER_WATCHDOG)
+        {
+            CheckMobpHealth();
+        }
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wParam)
+            g_shuttingDown = TRUE;
         return 0;
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_SCAN);
         KillTimer(hwnd, TIMER_START_MOBP);
+        KillTimer(hwnd, TIMER_WATCHDOG);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
         return 0;
@@ -362,9 +460,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     SetTimer(g_hwndMain, TIMER_SCAN, 200, NULL);
+    SetTimer(g_hwndMain, TIMER_WATCHDOG, WATCHDOG_INTERVAL_MS, NULL);
 
     if (QueryWindow(WORD_CLASS, TITLE_KEYWORD))
     {
+        g_mobpLaunched = TRUE;
+        g_lastLaunchTick = GetTickCount();
     }
     else
     {
